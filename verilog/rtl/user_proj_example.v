@@ -35,6 +35,8 @@
  *-------------------------------------------------------------
  */
 
+`define MAX_SOC 1
+`define BUS_WIDTH 16 
 module user_proj_example #(
     parameter BITS = 32
 )(
@@ -68,98 +70,171 @@ module user_proj_example #(
     // IRQ
     output [2:0] irq
 );
-    wire clk;
-    wire rst;
 
-    wire [`MPRJ_IO_PADS-1:0] io_in;
-    wire [`MPRJ_IO_PADS-1:0] io_out;
-    wire [`MPRJ_IO_PADS-1:0] io_oeb;
 
-    wire [31:0] rdata; 
-    wire [31:0] wdata;
-    wire [BITS-1:0] count;
+  localparam  STATUS_ADDR	    =  'd0; 
+  localparam  PRE_ADDR 			=  'd1; 
 
-    wire valid;
-    wire [3:0] wstrb;
-    wire [31:0] la_write;
+  reg [2*`BUS_WIDTH-1:0] status;
+  reg [2*`BUS_WIDTH-1:0] rdata;
+  reg [2*`BUS_WIDTH-1:0]  prescaler;
+  reg  wbs_done;
+  wire wb_valid;
+  wire [3:0] wstrb;
 
-    // WB MI A
-    assign valid = wbs_cyc_i && wbs_stb_i; 
-    assign wstrb = wbs_sel_i & {4{wbs_we_i}};
-    assign wbs_dat_o = rdata;
-    assign wdata = wbs_dat_i;
 
-    // IO
-    assign io_out = count;
-    assign io_oeb = {(`MPRJ_IO_PADS-1){rst}};
+  wire  [`MAX_SOC-1:0] cmp;
+  wire mclear;
+  wire mclk;
+  wire ce_pcm;
+  wire ce_pdm;
+  wire addr_valid;
 
-    // IRQ
-    assign irq = 3'b000;	// Unused
 
-    // LA
-    assign la_data_out = {{(127-BITS){1'b0}}, count};
-    // Assuming LA probes [63:32] are for controlling the count register  
-    assign la_write = ~la_oenb[63:32] & ~{BITS{valid}};
-    // Assuming LA probes [65:64] are for controlling the count clk & reset  
-    assign clk = (~la_oenb[64]) ? la_data_in[64]: wb_clk_i;
-    assign rst = (~la_oenb[65]) ? la_data_in[65]: wb_rst_i;
+  reg [`MAX_SOC-1:0] valid_i;
+  wire  strb_i;
+  wire [3:0] adr_i;
+  wire [`BUS_WIDTH-1:0] dat_i;
+  wire [10:0]  addr;
+  
+  wire [`BUS_WIDTH-1:0] dat_o[`MAX_SOC];
+  wire                  ack_o[`MAX_SOC];
 
-    counter #(
-        .BITS(BITS)
-    ) counter(
-        .clk(clk),
-        .reset(rst),
-        .ready(wbs_ack_o),
-        .valid(valid),
-        .rdata(rdata),
-        .wdata(wbs_dat_i),
-        .wstrb(wstrb),
-        .la_write(la_write),
-        .la_input(la_data_in[63:32]),
-        .count(count)
-    );
+  reg [`BUS_WIDTH-1:0] wbs_dat;
+  reg wbs_ack;
 
-endmodule
 
-module counter #(
-    parameter BITS = 32
-)(
-    input clk,
-    input reset,
-    input valid,
-    input [3:0] wstrb,
-    input [BITS-1:0] wdata,
-    input [BITS-1:0] la_write,
-    input [BITS-1:0] la_input,
-    output ready,
-    output [BITS-1:0] rdata,
-    output [BITS-1:0] count
-);
-    reg ready;
-    reg [BITS-1:0] count;
-    reg [BITS-1:0] rdata;
+  assign dat_i = {wbs_dat_i[31], wbs_dat_i[14:0]};
+  assign addr = ((wbs_adr_i[11:0] >> 2) - 11'd2);
+  assign adr_i = addr[3:0];
+  assign strb_i = wstrb[0];
 
-    always @(posedge clk) begin
-        if (reset) begin
-            count <= 0;
-            ready <= 0;
-        end else begin
-            ready <= 1'b0;
-            if (~|la_write) begin
-                count <= count + 1;
-            end
-            if (valid && !ready) begin
-                ready <= 1'b1;
-                rdata <= count;
-                if (wstrb[0]) count[7:0]   <= wdata[7:0];
-                if (wstrb[1]) count[15:8]  <= wdata[15:8];
-                if (wstrb[2]) count[23:16] <= wdata[23:16];
-                if (wstrb[3]) count[31:24] <= wdata[31:24];
-            end else if (|la_write) begin
-                count <= la_write & la_input;
-            end
-        end
+
+  assign wb_valid = wbs_cyc_i && wbs_stb_i; 
+  assign wstrb = wbs_sel_i & {4{wbs_we_i}};
+  assign addr_valid = (wbs_adr_i[31:28] == 3) ? 1 : 0;
+ 
+  assign irq[0] = ((|status) | (|prescaler[25:24]) );
+  /*clear send from CARAVEL*/
+  assign mclear  = la_data_in[0];
+  /*  assign 4.5 MHz clock on GPIO0*/
+  assign io_out[0] = mclk;
+  assign io_oeb[0] = 1'b0;
+  
+  assign io_oeb[1] = 1'b1;
+ 
+
+
+  always@(addr  or wb_valid or addr_valid) begin
+
+	if (wb_valid && addr_valid)  begin  
+        case(addr[10:4])   
+				 'd0 :  begin  valid_i[0]  <= 1'b1; end  
+                  default: begin valid_i <= 0 ;  end
+		endcase
     end
+    else 
+      valid_i <= 0;
+  end
+
+
+
+  always@(valid_i   or dat_o[0] or ack_o[0] ) begin
+        case(valid_i)   
+				 'h1     :  begin 
+							wbs_dat <=  dat_o[0];
+							wbs_ack <=  ack_o[0];
+                            end
+                  default: begin 
+							wbs_dat <=  0;
+							wbs_ack <=  0;
+                           end
+		endcase
+  end
+
+assign wbs_dat_o =   (valid_i != 0)  ? {{16{wbs_dat[15]}},wbs_dat} : rdata;
+assign wbs_ack_o =   (valid_i != 0)  ? wbs_ack                     : wbs_done;
+
+
+
+
+	always@(posedge wb_clk_i) begin
+		if(wb_rst_i) begin
+			wbs_done  <= 0;
+			status    <= 0;
+			prescaler <= 49;
+            rdata     <= 0;
+		end
+		else begin
+			wbs_done <= 0;
+			if (wb_valid && addr_valid)  begin     
+				case(wbs_adr_i[7:2])   
+					STATUS_ADDR: 
+ 						begin	
+                   	    	rdata <= status;
+						end            
+					PRE_ADDR:
+ 						begin	
+                   	        rdata <= prescaler;
+                   		if(strb_i)
+       						prescaler[9:0] <= wbs_dat_i[9:0];
+                        end
+                  default: ;
+				endcase
+ 			 wbs_done <= 1; 
+			end
+            else begin
+ 		    end        
+        end
+   end 
+
+
+/*  write status register */
+	always@(posedge wb_clk_i) begin
+		if(wb_rst_i) begin
+			status  <= 0;
+		end 
+        else 
+          status <= cmp;
+         // prescaler[25:24] <= cmp[33:32];
+       
+    end
+
+
+/*  ----------------------  STRUCTURAL DESIGN BEGINS ----------------------- */
+
+micclk  mic(
+        .clk(wb_clk_i),
+        .rst(wb_rst_i),
+        .mclk(mclk),
+        .ce_pdm(ce_pdm)
+        );
+
+pcm_clk  pcmclk(
+        .clk(wb_clk_i),
+        .rst(wb_rst_i),
+        .prescaler(prescaler[9:0]),
+        .ce_pcm(ce_pcm)
+        );
+ 
+
+SonarOnChip   soc1(
+
+    .wb_clk_i(wb_clk_i),
+    .wb_rst_i(wb_rst_i),
+    .wb_valid_i(valid_i[0]),
+    .wbs_adr_i(adr_i),
+    .wbs_dat_i(dat_i),
+    .wbs_strb_i(strb_i),
+    .wbs_ack_o(ack_o[0]),
+    .wbs_dat_o(dat_o[0]),
+    
+    .ce_pdm(ce_pdm),
+    .ce_pcm(ce_pcm),
+    .pdm_data_i(io_in[1]),
+    .mclear(mclear),
+    .cmp(cmp[0])
+	);
 
 endmodule
 `default_nettype wire
